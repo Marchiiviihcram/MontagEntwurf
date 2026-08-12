@@ -33,6 +33,10 @@
 - 忽略大体积资料包、安装器、视频、三维模型等文件。
 - 如需共享大资料，建议使用网盘链接或 GitHub Release。
 
+## 调试记录
+
+调试过程请记录到 [DEBUG_LOG.md](DEBUG_LOG.md)，每次你反馈系统状态、串口日志、参数修改建议时，都按统一模板补充，便于后续回看和复盘。
+
 ## VS Code 本地运行与调试（仅 PlatformIO）
 
 已完全按 VS Code + PlatformIO 工作流配置，不再依赖 Arduino IDE。
