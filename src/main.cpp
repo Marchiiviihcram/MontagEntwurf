@@ -1,0 +1,647 @@
+/*
+ * ============================================================================
+ * ESP32 + FGr8B接收机 + TB6612驱动 + MG310电机 差速转向小车
+ * 功能: PWM信号读取 → 差速混合 → PID速度闭环 → TB6612双电机驱动
+ * ============================================================================
+ *
+ * ============================ 接线表 ========================================
+ * 1. FGr8B 接收机 → ESP32
+ *    CH1 (转向) ──── GPIO25
+ *    CH2 (油门) ──── GPIO26
+ *    接收机 VCC ──── ESP32 3.3V (或独立BEC 5V)
+ *    接收机 GND ──── ESP32 GND
+ *
+ * 2. TB6612 驱动模块 → ESP32
+ *    PWMA (左速度) ─ GPIO16
+ *    AIN1 (左方向) ─ GPIO17
+ *    AIN2 (左方向) ─ GPIO4
+ *    PWMB (右速度) ─ GPIO19
+ *    BIN1 (右方向) ─ GPIO18
+ *    BIN2 (右方向) ─ GPIO5
+ *    STBY (待机)   ─ GPIO21  (或直接接3.3V)
+ *
+ * 3. TB6612 电源
+ *    VM  ──── 12V 电池正极  (MG310电机电源)
+ *    VCC ──── 5V             (逻辑电源)
+ *    GND ──── 电池负极 + ESP32 GND (共地!!!)
+ *    AO1/AO2 ── 左电机 (MG310)
+ *    BO1/BO2 ── 右电机 (MG310)
+ *
+ * 4. MG310 编码器 → ESP32 (编码器供电通常5V, 信号线需分压或ESP32容忍5V)
+ *    左编码器 A ── GPIO34 (仅输入)
+ *    左编码器 B ── GPIO35 (仅输入)
+ *    右编码器 A ── GPIO32
+ *    右编码器 B ── GPIO33
+ *    编码器 VCC ── 5V  (注意: ESP32 GPIO建议3.3V, 若编码器输出5V需加电平转换)
+ *    编码器 GND ── ESP32 GND
+ * ============================================================================
+ */
+
+#include <Arduino.h>
+
+// ============================================================================
+// 引脚定义
+// ============================================================================
+
+// --- FGr8B 接收机 ---
+#define CH1_PIN         25    // 接收机CH1 转向 (1000-2000µs)
+#define CH2_PIN         26    // 接收机CH2 油门 (1000-2000µs)
+
+// --- TB6612 左电机 (A通道) ---
+#define LEFT_PWM        16    // PWMA 速度
+#define LEFT_IN1        17    // AIN1 方向
+#define LEFT_IN2        4     // AIN2 方向
+
+// --- TB6612 右电机 (B通道) ---
+#define RIGHT_PWM       19    // PWMB 速度
+#define RIGHT_IN1       18    // BIN1 方向
+#define RIGHT_IN2       5     // BIN2 方向
+
+// --- TB6612 待机 ---
+#define STBY_PIN        21    // STBY (HIGH=工作, LOW=休眠)
+
+// --- 左电机编码器 ---
+#define LEFT_ENC_A      34    // A相 (GPIO34-39仅输入, 无内部上拉, 需外接上拉)
+#define LEFT_ENC_B      35    // B相
+
+// --- 右电机编码器 ---
+#define RIGHT_ENC_A     32    // A相
+#define RIGHT_ENC_B     33    // B相
+
+// ============================================================================
+// 遥控信号参数
+// ============================================================================
+const int PWM_MIN       = 1000;   // 接收机PWM最小脉宽 (µs)
+const int PWM_MAX       = 2000;   // 接收机PWM最大脉宽 (µs)
+const int PWM_CENTER    = 1500;   // 接收机PWM中位 (µs)
+const int PWM_VALID_MIN = 900;    // 有效脉宽下限
+const int PWM_VALID_MAX = 2100;   // 有效脉宽上限
+const int DEADBAND      = 30;     // 摇杆死区 (µs偏移量, 30≈3%)
+const int TIMEOUT_MS    = 100;    // 失控保护超时 (ms)
+
+// ============================================================================
+// TB6612 参数
+// ============================================================================
+const int PWM_FREQ      = 20000;  // PWM频率 (Hz, TB6612支持≤100kHz, 20kHz无啸叫)
+const int PWM_RES        = 8;     // PWM分辨率 (8bit=0-255)
+const int PWM_MAX_VAL   = 255;    // PWM最大值
+
+// ============================================================================
+// 编码器参数 (MG310: 11线编码器, 减速比1:30)
+// ============================================================================
+const float ENCODER_PPR      = 11.0;      // 电机端每转脉冲数
+const float GEAR_RATIO       = 30.0;      // 减速比
+const float PULSES_PER_REV   = ENCODER_PPR * GEAR_RATIO * 4.0;  // 4倍频后输出轴每转计数 ≈1320
+
+// ============================================================================
+// PID 控制间隔 (ms)
+// ============================================================================
+const int PID_INTERVAL_MS    = 20;        // PID计算周期 (50Hz控制频率)
+
+// ============================================================================
+// 差速转向参数
+// ============================================================================
+const int   THROTTLE_RANGE   = 500;       // 油门映射范围 (±500)
+const int   STEER_RANGE      = 500;       // 转向映射范围 (±500)
+const float MAX_TARGET_CNT   = 50.0;      // 每PID间隔最大目标计数 (≈110RPM时44个)
+
+// ============================================================================
+// PID 参数 (需实车调试)
+// ============================================================================
+// 左电机 PID
+float leftKp  = 2.5;
+float leftKi  = 0.3;
+float leftKd  = 0.0;
+
+// 右电机 PID
+float rightKp = 2.5;
+float rightKi = 0.3;
+float rightKd = 0.0;
+
+// PID 输出限幅
+const int PID_OUT_MAX = 255;
+
+// ============================================================================
+// 全局变量 — PWM 捕获 (中断安全)
+// ============================================================================
+volatile unsigned long ch1RiseTime   = 0;
+volatile unsigned long ch1PulseWidth = 1500;  // 默认中位
+volatile bool          ch1Updated    = false;
+
+volatile unsigned long ch2RiseTime   = 0;
+volatile unsigned long ch2PulseWidth = 1500;  // 默认中位
+volatile bool          ch2Updated    = false;
+
+unsigned long lastSignalMs  = 0;
+bool          failsafeActive = false;
+
+// ============================================================================
+// 全局变量 — 编码器计数 (中断安全, 4倍频)
+// ============================================================================
+volatile long leftEncoderCount  = 0;
+volatile long rightEncoderCount = 0;
+
+// ============================================================================
+// 全局变量 — PID 状态
+// ============================================================================
+float leftTargetSpeed  = 0;     // 左电机目标速度 (counts/PID间隔)
+float rightTargetSpeed = 0;     // 右电机目标速度
+float leftActualSpeed  = 0;     // 左电机实际速度
+float rightActualSpeed = 0;     // 右电机实际速度
+
+long  lastLeftCount    = 0;
+long  lastRightCount   = 0;
+
+float leftIntegral     = 0;
+float leftPrevError    = 0;
+float rightIntegral    = 0;
+float rightPrevError   = 0;
+
+int   leftMotorPWM     = 0;
+int   rightMotorPWM    = 0;
+
+unsigned long lastPIDTime = 0;
+
+// ============================================================================
+// 调试开关
+// ============================================================================
+const bool SERIAL_DEBUG = true;   // true=串口输出调试信息, false=关闭
+const bool STATUS_TELEMETRY = true;
+const unsigned long STATUS_INTERVAL_MS = 200;
+unsigned long lastStatusTime = 0;
+
+// 结构化状态行，便于在串口工具中做日志筛选和数据导出。
+void printStatusLine(unsigned long ch1Width, unsigned long ch2Width, int throttle, int steering) {
+    long leftCountNow;
+    long rightCountNow;
+
+    noInterrupts();
+    leftCountNow = leftEncoderCount;
+    rightCountNow = rightEncoderCount;
+    interrupts();
+
+    Serial.print("STAT,ms=");
+    Serial.print(millis());
+    Serial.print(",failsafe=");
+    Serial.print(failsafeActive ? 1 : 0);
+    Serial.print(",rc1=");
+    Serial.print(ch1Width);
+    Serial.print(",rc2=");
+    Serial.print(ch2Width);
+    Serial.print(",thr=");
+    Serial.print(throttle);
+    Serial.print(",str=");
+    Serial.print(steering);
+    Serial.print(",tgtL=");
+    Serial.print(leftTargetSpeed, 2);
+    Serial.print(",tgtR=");
+    Serial.print(rightTargetSpeed, 2);
+    Serial.print(",actL=");
+    Serial.print(leftActualSpeed, 2);
+    Serial.print(",actR=");
+    Serial.print(rightActualSpeed, 2);
+    Serial.print(",pwmL=");
+    Serial.print(leftMotorPWM);
+    Serial.print(",pwmR=");
+    Serial.print(rightMotorPWM);
+    Serial.print(",encL=");
+    Serial.print(leftCountNow);
+    Serial.print(",encR=");
+    Serial.println(rightCountNow);
+}
+
+// ============================================================================
+// PWM 输入中断 — CH1 (转向)
+// ============================================================================
+void IRAM_ATTR ch1ISR() {
+    if (digitalRead(CH1_PIN) == HIGH) {
+        ch1RiseTime = micros();
+    } else {
+        unsigned long width = micros() - ch1RiseTime;
+        if (width >= PWM_VALID_MIN && width <= PWM_VALID_MAX) {
+            ch1PulseWidth = width;
+            ch1Updated = true;
+        }
+    }
+}
+
+// ============================================================================
+// PWM 输入中断 — CH2 (油门)
+// ============================================================================
+void IRAM_ATTR ch2ISR() {
+    if (digitalRead(CH2_PIN) == HIGH) {
+        ch2RiseTime = micros();
+    } else {
+        unsigned long width = micros() - ch2RiseTime;
+        if (width >= PWM_VALID_MIN && width <= PWM_VALID_MAX) {
+            ch2PulseWidth = width;
+            ch2Updated = true;
+        }
+    }
+}
+
+// ============================================================================
+// 编码器中断 — 左电机 A 相 (4倍频)
+// ============================================================================
+void IRAM_ATTR leftEncA_ISR() {
+    if (digitalRead(LEFT_ENC_A) == HIGH) {
+        if (digitalRead(LEFT_ENC_B) == LOW)  leftEncoderCount++;
+        else                                  leftEncoderCount--;
+    } else {
+        if (digitalRead(LEFT_ENC_B) == LOW)  leftEncoderCount--;
+        else                                  leftEncoderCount++;
+    }
+}
+
+// ============================================================================
+// 编码器中断 — 左电机 B 相 (4倍频)
+// ============================================================================
+void IRAM_ATTR leftEncB_ISR() {
+    if (digitalRead(LEFT_ENC_B) == HIGH) {
+        if (digitalRead(LEFT_ENC_A) == HIGH) leftEncoderCount++;
+        else                                  leftEncoderCount--;
+    } else {
+        if (digitalRead(LEFT_ENC_A) == HIGH) leftEncoderCount--;
+        else                                  leftEncoderCount++;
+    }
+}
+
+// ============================================================================
+// 编码器中断 — 右电机 A 相 (4倍频)
+// ============================================================================
+void IRAM_ATTR rightEncA_ISR() {
+    if (digitalRead(RIGHT_ENC_A) == HIGH) {
+        if (digitalRead(RIGHT_ENC_B) == LOW)  rightEncoderCount++;
+        else                                   rightEncoderCount--;
+    } else {
+        if (digitalRead(RIGHT_ENC_B) == LOW)  rightEncoderCount--;
+        else                                   rightEncoderCount++;
+    }
+}
+
+// ============================================================================
+// 编码器中断 — 右电机 B 相 (4倍频)
+// ============================================================================
+void IRAM_ATTR rightEncB_ISR() {
+    if (digitalRead(RIGHT_ENC_B) == HIGH) {
+        if (digitalRead(RIGHT_ENC_A) == HIGH) rightEncoderCount++;
+        else                                   rightEncoderCount--;
+    } else {
+        if (digitalRead(RIGHT_ENC_A) == HIGH) rightEncoderCount--;
+        else                                   rightEncoderCount++;
+    }
+}
+
+// ============================================================================
+// 读取遥控信号 (带失控保护)
+// 返回 true=信号正常, false=失控
+// ============================================================================
+bool readChannels(unsigned long &ch1, unsigned long &ch2) {
+    bool updated;
+
+    noInterrupts();
+    ch1 = ch1PulseWidth;
+    ch2 = ch2PulseWidth;
+    updated = ch1Updated || ch2Updated;
+    ch1Updated = false;
+    ch2Updated = false;
+    interrupts();
+
+    if (updated) {
+        lastSignalMs = millis();
+    }
+
+    // 超时检查 — 超过TIMEOUT_MS无新信号则触发失控保护
+    if (millis() - lastSignalMs > TIMEOUT_MS) {
+        return false;
+    }
+    return true;
+}
+
+// ============================================================================
+// 读取编码器速度 (counts/PID_INTERVAL_MS)
+// 调用间隔固定为PID_INTERVAL_MS时测量最准确
+// ============================================================================
+void readEncoderSpeed() {
+    long leftNow, rightNow;
+
+    noInterrupts();
+    leftNow  = leftEncoderCount;
+    rightNow = rightEncoderCount;
+    interrupts();
+
+    leftActualSpeed  = (float)(leftNow  - lastLeftCount);
+    rightActualSpeed = (float)(rightNow - lastRightCount);
+
+    lastLeftCount  = leftNow;
+    lastRightCount = rightNow;
+}
+
+// ============================================================================
+// 差速混合 — 坦克转向算法
+// throttle: -500~+500 (负=后退, 正=前进)
+// steering: -500~+500 (负=左转, 正=右转)
+// 输出: 左右电机目标速度 (counts/PID间隔)
+// ============================================================================
+void differentialMix(int throttle, int steering,
+                     float &outLeft, float &outRight) {
+
+    // 油门 → 基础速度映射
+    float baseSpeed = (float)throttle / THROTTLE_RANGE * MAX_TARGET_CNT;
+
+    // 转向分量
+    float steerRatio = (float)steering / STEER_RANGE;
+
+    if (abs(steering) <= DEADBAND) {
+        // 死区内直行 — 两侧等速
+        outLeft  = baseSpeed;
+        outRight = baseSpeed;
+    } else {
+        // 差速转向: 一侧加速, 另一侧减速/反转
+        // steerRatio >0 右转 → 左轮快、右轮慢
+        // steerRatio <0 左转 → 右轮快、左轮慢
+        float steerDelta = fabs(steerRatio) * MAX_TARGET_CNT;
+
+        if (steerRatio > 0) {
+            // 右转
+            outLeft  = baseSpeed + steerDelta;
+            outRight = baseSpeed - steerDelta;
+        } else {
+            // 左转
+            outLeft  = baseSpeed - steerDelta;
+            outRight = baseSpeed + steerDelta;
+        }
+    }
+
+    // 如果油门很小但转向很大 → 原地旋转
+    if (abs(throttle) <= DEADBAND * 2 && abs(steering) > DEADBAND) {
+        float spotTurnSpeed = (fabs(steerRatio) * MAX_TARGET_CNT) * 0.8;
+        if (steerRatio > 0) {
+            outLeft  =  spotTurnSpeed;
+            outRight = -spotTurnSpeed;
+        } else {
+            outLeft  = -spotTurnSpeed;
+            outRight =  spotTurnSpeed;
+        }
+    }
+
+    // 限幅
+    outLeft  = constrain(outLeft,  -MAX_TARGET_CNT, MAX_TARGET_CNT);
+    outRight = constrain(outRight, -MAX_TARGET_CNT, MAX_TARGET_CNT);
+}
+
+// ============================================================================
+// 增量式 PID 速度控制器 (单路)
+// 公式: PWM += Kp*[e(k)-e(k-1)] + Ki*e(k) + Kd*[e(k)-2e(k-1)+e(k-2)]
+// target: 目标速度 (counts/PID间隔)
+// actual: 实际速度 (counts/PID间隔)
+// 返回: PWM值 (0~255正向, -255~0反向)
+// ============================================================================
+int speedPID(float target, float actual,
+             float &integral, float &prevError, float &prevPrevError,
+             float kp, float ki, float kd) {
+
+    float error = target - actual;
+
+    // 积分分离: 大偏差时不积分, 防止积分饱和
+    if (fabs(error) < MAX_TARGET_CNT * 0.5) {
+        integral += error;
+        // 积分限幅
+        integral = constrain(integral, -PID_OUT_MAX / ki, PID_OUT_MAX / ki);
+    } else {
+        integral = 0;
+    }
+
+    // 增量式 PID
+    float output = kp * (error - prevError)
+                 + ki * error
+                 + kd * (error - 2.0 * prevError + prevPrevError);
+
+    prevPrevError = prevError;
+    prevError = error;
+
+    // 输出限幅
+    return (int)constrain(output, -PID_OUT_MAX, PID_OUT_MAX);
+}
+
+// ============================================================================
+// 设置TB6612电机输出
+// pwm: -255~+255 (负=反转, 正=正转)
+// ============================================================================
+void setMotor(int in1, int in2, int pwmPin, int pwmVal) {
+    if (pwmVal > 0) {
+        // 正转
+        digitalWrite(in1, HIGH);
+        digitalWrite(in2, LOW);
+        ledcWrite(pwmPin, pwmVal);
+    } else if (pwmVal < 0) {
+        // 反转
+        digitalWrite(in1, LOW);
+        digitalWrite(in2, HIGH);
+        ledcWrite(pwmPin, -pwmVal);
+    } else {
+        // 刹车 (短接制动)
+        digitalWrite(in1, HIGH);
+        digitalWrite(in2, HIGH);
+        ledcWrite(pwmPin, 0);
+    }
+}
+
+// ============================================================================
+// 电机紧急停止
+// ============================================================================
+void motorsStop() {
+    digitalWrite(STBY_PIN, LOW);   // TB6612 休眠
+    digitalWrite(LEFT_IN1, LOW);
+    digitalWrite(LEFT_IN2, LOW);
+    digitalWrite(RIGHT_IN1, LOW);
+    digitalWrite(RIGHT_IN2, LOW);
+    ledcWrite(0, 0);
+    ledcWrite(1, 0);
+
+    // 重置 PID 状态
+    leftIntegral = leftPrevError = 0;
+    rightIntegral = rightPrevError = 0;
+    leftMotorPWM = rightMotorPWM = 0;
+}
+
+// ============================================================================
+// setup — 初始化
+// ============================================================================
+void setup() {
+    Serial.begin(115200);
+    delay(200);
+
+    Serial.println();
+    Serial.println("==============================================");
+    Serial.println(" ESP32 Differential Steering Car");
+    Serial.println(" RX: FlySky FGr8B  |  Driver: TB6612");
+    Serial.println(" Motor: MG310 x2   |  Control: PID Speed Loop");
+    Serial.println("==============================================");
+
+    // --- 接收机 PWM 输入引脚 ---
+    pinMode(CH1_PIN, INPUT);
+    pinMode(CH2_PIN, INPUT);
+    attachInterrupt(digitalPinToInterrupt(CH1_PIN), ch1ISR, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(CH2_PIN), ch2ISR, CHANGE);
+
+    // --- TB6612 控制引脚 ---
+    pinMode(LEFT_IN1, OUTPUT);
+    pinMode(LEFT_IN2, OUTPUT);
+    pinMode(RIGHT_IN1, OUTPUT);
+    pinMode(RIGHT_IN2, OUTPUT);
+    pinMode(STBY_PIN, OUTPUT);
+
+    // LEDC PWM 配置 (通道0=左电机, 通道1=右电机)
+    ledcSetup(0, PWM_FREQ, PWM_RES);
+    ledcSetup(1, PWM_FREQ, PWM_RES);
+    ledcAttachPin(LEFT_PWM, 0);
+    ledcAttachPin(RIGHT_PWM, 1);
+
+    // TB6612 使能
+    digitalWrite(STBY_PIN, HIGH);
+
+    // 初始刹车
+    digitalWrite(LEFT_IN1, HIGH);
+    digitalWrite(LEFT_IN2, HIGH);
+    digitalWrite(RIGHT_IN1, HIGH);
+    digitalWrite(RIGHT_IN2, HIGH);
+    ledcWrite(0, 0);
+    ledcWrite(1, 0);
+
+    // --- 编码器引脚 + 中断 ---
+    pinMode(LEFT_ENC_A, INPUT_PULLUP);
+    pinMode(LEFT_ENC_B, INPUT_PULLUP);
+    pinMode(RIGHT_ENC_A, INPUT_PULLUP);
+    pinMode(RIGHT_ENC_B, INPUT_PULLUP);
+
+    attachInterrupt(digitalPinToInterrupt(LEFT_ENC_A),  leftEncA_ISR,  CHANGE);
+    attachInterrupt(digitalPinToInterrupt(LEFT_ENC_B),  leftEncB_ISR,  CHANGE);
+    attachInterrupt(digitalPinToInterrupt(RIGHT_ENC_A), rightEncA_ISR, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(RIGHT_ENC_B), rightEncB_ISR, CHANGE);
+
+    // --- 初始化时间戳 ---
+    lastSignalMs = millis();
+    lastPIDTime  = millis();
+    lastStatusTime = millis();
+
+    Serial.println("System ready. Waiting for RC signal...");
+}
+
+// ============================================================================
+// 全局变量 — 用于loop中传递速度数据
+// ============================================================================
+static float prevPrevLeftErr  = 0;
+static float prevPrevRightErr = 0;
+
+// ============================================================================
+// loop — 主循环
+// ============================================================================
+void loop() {
+    // ========================================================================
+    // 1. 读取遥控信号
+    // ========================================================================
+    unsigned long ch1Width, ch2Width;
+    if (!readChannels(ch1Width, ch2Width)) {
+        // 失控保护
+        if (!failsafeActive) {
+            Serial.println("!! FAILSAFE — No signal, motors stopped !!");
+            failsafeActive = true;
+        }
+        motorsStop();
+        delay(10);
+        return;
+    }
+
+    if (failsafeActive) {
+        Serial.println("Signal recovered.");
+        failsafeActive = false;
+    }
+
+    // ========================================================================
+    // 2. PWM脉宽 → 油门/转向值
+    // ========================================================================
+    int throttleRaw = map((long)ch2Width, PWM_MIN, PWM_MAX, -THROTTLE_RANGE, THROTTLE_RANGE);
+    int steeringRaw = map((long)ch1Width, PWM_MIN, PWM_MAX, -STEER_RANGE, STEER_RANGE);
+    throttleRaw = constrain(throttleRaw, -THROTTLE_RANGE, THROTTLE_RANGE);
+    steeringRaw = constrain(steeringRaw, -STEER_RANGE, STEER_RANGE);
+
+    // 死区滤波
+    int throttle = (abs(throttleRaw) < DEADBAND) ? 0 : throttleRaw;
+    int steering = (abs(steeringRaw) < DEADBAND) ? 0 : steeringRaw;
+
+    // ========================================================================
+    // 3. PID 定时控制 (PID_INTERVAL_MS 执行一次)
+    // ========================================================================
+    if (millis() - lastPIDTime >= PID_INTERVAL_MS) {
+        lastPIDTime = millis();
+
+        // --- 3a. 读取编码器速度 ---
+        readEncoderSpeed();
+
+        // --- 3b. 差速混合 → 目标速度 ---
+        differentialMix(throttle, steering, leftTargetSpeed, rightTargetSpeed);
+
+        // --- 3c. 左右电机 PID 计算 ---
+        leftMotorPWM  = speedPID(leftTargetSpeed,  leftActualSpeed,
+                                 leftIntegral, leftPrevError, prevPrevLeftErr,
+                                 leftKp, leftKi, leftKd);
+
+        rightMotorPWM = speedPID(rightTargetSpeed, rightActualSpeed,
+                                 rightIntegral, rightPrevError, prevPrevRightErr,
+                                 rightKp, rightKi, rightKd);
+
+        // --- 3d. 输出到 TB6612 ---
+        setMotor(LEFT_IN1, LEFT_IN2, LEFT_PWM, leftMotorPWM);
+        setMotor(RIGHT_IN1, RIGHT_IN2, RIGHT_PWM, rightMotorPWM);
+
+        // --- 3e. 调试输出 ---
+        if (SERIAL_DEBUG) {
+            Serial.print("RC:");
+            Serial.print(ch1Width);
+            Serial.print("/");
+            Serial.print(ch2Width);
+            Serial.print(" Thr:");
+            Serial.print(throttle);
+            Serial.print(" Str:");
+            Serial.print(steering);
+            Serial.print(" | Tgt:[");
+            Serial.print(leftTargetSpeed, 1);
+            Serial.print(",");
+            Serial.print(rightTargetSpeed, 1);
+            Serial.print("] Act:[");
+            Serial.print(leftActualSpeed, 1);
+            Serial.print(",");
+            Serial.print(rightActualSpeed, 1);
+            Serial.print("] PWM:[");
+            Serial.print(leftMotorPWM);
+            Serial.print(",");
+            Serial.print(rightMotorPWM);
+            Serial.println("]");
+        }
+
+        if (STATUS_TELEMETRY && (millis() - lastStatusTime >= STATUS_INTERVAL_MS)) {
+            lastStatusTime = millis();
+            printStatusLine(ch1Width, ch2Width, throttle, steering);
+        }
+    }
+
+    // ========================================================================
+    // 4. 遥控停止时让电机完全停下来
+    // ========================================================================
+    if (throttle == 0 && steering == 0) {
+        // 摇杆回中 — 主动刹车
+        digitalWrite(LEFT_IN1, HIGH);
+        digitalWrite(LEFT_IN2, HIGH);
+        digitalWrite(RIGHT_IN1, HIGH);
+        digitalWrite(RIGHT_IN2, HIGH);
+        ledcWrite(0, 0);
+        ledcWrite(1, 0);
+        // 重置积分防止再次启动时抖动
+        leftIntegral = leftPrevError = prevPrevLeftErr = 0;
+        rightIntegral = rightPrevError = prevPrevRightErr = 0;
+        leftMotorPWM = rightMotorPWM = 0;
+    }
+
+    delay(5);  // 主循环频率 ≈200Hz, PID在内部以50Hz运行
+}

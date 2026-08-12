@@ -1,6 +1,9 @@
 # macOS / Editor
 .DS_Store
-.vscode/
+
+# PlatformIO / Python env
+.pio/
+.venv/
 
 # Archives and installers
 *.zip
@@ -22,3 +25,8 @@ WHEELTEC 直流电机附送资料/
 # Optional local notes
 *.log
 *.tmp
+
+# Keep VS Code task/workflow files tracked
+.vscode/*
+!.vscode/tasks.json
+!.vscode/extensions.json
