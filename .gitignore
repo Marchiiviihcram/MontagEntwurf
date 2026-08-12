@@ -1,0 +1,24 @@
+# macOS / Editor
+.DS_Store
+.vscode/
+
+# Archives and installers
+*.zip
+*.rar
+*.7z
+*.exe
+
+# Large media and binaries
+*.mp4
+*.jpg
+*.jpeg
+*.png
+*.stp
+
+# Office docs and vendor handouts
+*.docx
+WHEELTEC 直流电机附送资料/
+
+# Optional local notes
+*.log
+*.tmp
